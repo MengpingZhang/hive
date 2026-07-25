@@ -254,16 +254,51 @@ func ValidateBundle(manifestPath string, options ValidationOptions) (*ValidatedB
 }
 
 func (bundle *ValidatedBundle) Import(store *beads.Store) (beads.BatchResult, error) {
-	items := make([]beads.BatchInput, 0, len(bundle.Beads))
+	return importProjections(bundle.Manifest, bundle.Beads, store)
+}
+
+// ImportByActor routes each validated Visual Hive projection to the Hive bead
+// store named by its actor. This preserves agent ownership so channel-based
+// agents, such as ux-scout, receive only their intended work items.
+func (bundle *ValidatedBundle) ImportByActor(beadsRoot string) (beads.BatchResult, error) {
+	if strings.TrimSpace(beadsRoot) == "" {
+		return beads.BatchResult{}, fmt.Errorf("beads root is required")
+	}
+	result := beads.BatchResult{}
+	byActor := make(map[string][]Projection)
 	for _, projection := range bundle.Beads {
+		actor, err := actorStoreName(projection.Actor)
+		if err != nil {
+			return result, err
+		}
+		byActor[actor] = append(byActor[actor], projection)
+	}
+	for actor, projections := range byActor {
+		store, err := beads.NewStore(filepath.Join(beadsRoot, actor))
+		if err != nil {
+			return result, fmt.Errorf("open beads store for %s: %w", actor, err)
+		}
+		imported, err := importProjections(bundle.Manifest, projections, store)
+		if err != nil {
+			return result, fmt.Errorf("import beads for %s: %w", actor, err)
+		}
+		result.Created += imported.Created
+		result.Skipped += imported.Skipped
+	}
+	return result, nil
+}
+
+func importProjections(manifest Manifest, projections []Projection, store *beads.Store) (beads.BatchResult, error) {
+	items := make([]beads.BatchInput, 0, len(projections))
+	for _, projection := range projections {
 		metadata := make(map[string]interface{}, len(projection.Metadata)+4)
 		for key, value := range projection.Metadata {
 			metadata[key] = value
 		}
-		metadata["visual_hive_bundle_id"] = bundle.Manifest.BundleID
-		metadata["visual_hive_digest"] = bundle.Manifest.OverallDigest
-		metadata["visual_hive_repository"] = bundle.Manifest.Source.Repository
-		metadata["visual_hive_commit"] = bundle.Manifest.Source.CommitSHA
+		metadata["visual_hive_bundle_id"] = manifest.BundleID
+		metadata["visual_hive_digest"] = manifest.OverallDigest
+		metadata["visual_hive_repository"] = manifest.Source.Repository
+		metadata["visual_hive_commit"] = manifest.Source.CommitSHA
 		items = append(items, beads.BatchInput{
 			SourceID: projection.ID, Title: projection.Title, Type: beadType(projection.Type),
 			Status: beadStatus(projection.Status), Priority: beadPriority(projection.Priority), Actor: projection.Actor,
@@ -271,6 +306,15 @@ func (bundle *ValidatedBundle) Import(store *beads.Store) (beads.BatchResult, er
 		})
 	}
 	return store.ImportBatch(items)
+}
+
+func actorStoreName(actor string) (string, error) {
+	name := strings.TrimSpace(actor)
+	name = strings.TrimPrefix(name, "hive/")
+	if name == "" || !safeID.MatchString(name) {
+		return "", fmt.Errorf("Visual Hive bead actor %q is not a safe Hive agent name", actor)
+	}
+	return name, nil
 }
 
 func validateManifest(m Manifest, options ValidationOptions) error {
